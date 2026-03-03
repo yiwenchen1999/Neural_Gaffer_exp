@@ -278,7 +278,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--polyhaven_data_root",
         type=str,
-        default="./source_data_polyhaven",
+        default="/home/ubuntu/LVSMExp/source_data_polyhaven",
         help="Root directory for polyhaven-format relighting evaluation data.",
     )
     parser.add_argument(

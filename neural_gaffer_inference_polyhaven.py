@@ -8,7 +8,7 @@ Usage:
         --output_dir neural_gaffer_res256 \
         --mixed_precision fp16 \
         --resume_from_checkpoint latest \
-        --polyhaven_data_root ./source_data_polyhaven \
+        --polyhaven_data_root /home/ubuntu/LVSMExp/source_data_polyhaven \
         --save_dir ./polyhaven_relighting_results
 """
 
