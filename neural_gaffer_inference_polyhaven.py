@@ -5,7 +5,7 @@ Usage:
     accelerate launch --main_process_port 25539 \
         --config_file configs/1_16fp.yaml \
         neural_gaffer_inference_polyhaven.py \
-        --output_dir logs/neural_gaffer_res256 \
+        --output_dir neural_gaffer_res256 \
         --mixed_precision fp16 \
         --resume_from_checkpoint latest \
         --polyhaven_data_root ./source_data_polyhaven \
