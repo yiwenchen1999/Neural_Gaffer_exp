@@ -38,6 +38,8 @@ from diffusers import (
 from pipeline_neural_gaffer import Neural_Gaffer_StableDiffusionPipeline
 
 import torchvision
+import lpips
+from skimage.metrics import structural_similarity as ssim
 
 logger = get_logger(__name__)
 
@@ -49,6 +51,11 @@ def compute_psnr(pred, gt):
     if mse == 0:
         return float("inf")
     return 20.0 * np.log10(1.0 / np.sqrt(mse))
+
+
+def compute_ssim(pred, gt):
+    """Compute SSIM between two HWC float32 images in [0, 1]."""
+    return ssim(gt, pred, data_range=1.0, channel_axis=2)
 
 
 def log_validation(
@@ -79,7 +86,12 @@ def log_validation(
     save_dir = args.save_dir
     os.makedirs(save_dir, exist_ok=True)
 
+    lpips_fn = lpips.LPIPS(net="alex").to(accelerator.device)
+    lpips_fn.eval()
+
     all_psnr = []
+    all_ssim = []
+    all_lpips = []
 
     for valid_step, batch in tqdm(enumerate(validation_dataloader)):
         if args.num_validation_batches is not None and valid_step >= args.num_validation_batches:
@@ -117,12 +129,29 @@ def log_validation(
         target_npy = 0.5 * (target_image.permute(0, 2, 3, 1).cpu().float().numpy() + 1.0)
         envmap_ldr_npy = 0.5 * (target_envmap_ldr.permute(0, 2, 3, 1).cpu().float().numpy() + 1.0)
 
+        pred_batch_np = np.stack(
+            [np.array(pipeline_output_images[i], dtype=np.float32) / 255.0 for i in range(batchsize)],
+            axis=0,
+        )
+
+        pred_torch = torch.from_numpy(pred_batch_np).permute(0, 3, 1, 2).float().to(accelerator.device) * 2.0 - 1.0
+        gt_torch = target_image.float()  # already in [-1, 1]
+        with torch.no_grad():
+            lpips_vals = lpips_fn(pred_torch, gt_torch).squeeze()  # [B] or scalar
+        if lpips_vals.dim() == 0:
+            lpips_vals = lpips_vals.unsqueeze(0)
+
         for i in range(batchsize):
-            pred_np = np.array(pipeline_output_images[i], dtype=np.float32) / 255.0
+            pred_np = pred_batch_np[i]
             gt_np = target_npy[i]
 
             psnr_val = compute_psnr(pred_np, gt_np)
+            ssim_val = compute_ssim(pred_np, gt_np)
+            lpips_val = lpips_vals[i].item()
+
             all_psnr.append(psnr_val)
+            all_ssim.append(ssim_val)
+            all_lpips.append(lpips_val)
 
             name = cond_image_names[i]
             view_name = target_envir_map_names[i]
@@ -148,15 +177,25 @@ def log_validation(
 
     if all_psnr:
         mean_psnr = np.mean(all_psnr)
-        print(f"\n{'='*50}")
-        print(f"  Mean PSNR: {mean_psnr:.4f} dB  ({len(all_psnr)} samples)")
-        print(f"{'='*50}\n")
+        mean_ssim = np.mean(all_ssim)
+        mean_lpips = np.mean(all_lpips)
+        n = len(all_psnr)
+
+        print(f"\n{'='*60}")
+        print(f"  Results ({n} samples)")
+        print(f"  Mean PSNR:  {mean_psnr:.4f} dB")
+        print(f"  Mean SSIM:  {mean_ssim:.4f}")
+        print(f"  Mean LPIPS: {mean_lpips:.4f}")
+        print(f"{'='*60}\n")
 
         with open(os.path.join(save_dir, "metrics.txt"), "w") as f:
+            f.write(f"num_samples: {n}\n")
             f.write(f"mean_psnr: {mean_psnr:.4f}\n")
-            f.write(f"num_samples: {len(all_psnr)}\n")
-            for idx, p in enumerate(all_psnr):
-                f.write(f"sample_{idx}: {p:.4f}\n")
+            f.write(f"mean_ssim: {mean_ssim:.4f}\n")
+            f.write(f"mean_lpips: {mean_lpips:.4f}\n")
+            f.write(f"\n{'idx':>5s}  {'psnr':>8s}  {'ssim':>8s}  {'lpips':>8s}\n")
+            for idx in range(n):
+                f.write(f"{idx:5d}  {all_psnr[idx]:8.4f}  {all_ssim[idx]:8.4f}  {all_lpips[idx]:8.4f}\n")
 
     return True
 
