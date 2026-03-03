@@ -39,7 +39,7 @@ from pipeline_neural_gaffer import Neural_Gaffer_StableDiffusionPipeline
 
 import torchvision
 import lpips
-from skimage.metrics import structural_similarity as ssim
+import torch.nn.functional as F
 
 logger = get_logger(__name__)
 
@@ -53,9 +53,40 @@ def compute_psnr(pred, gt):
     return 20.0 * np.log10(1.0 / np.sqrt(mse))
 
 
-def compute_ssim(pred, gt):
-    """Compute SSIM between two HWC float32 images in [0, 1]."""
-    return ssim(gt, pred, data_range=1.0, channel_axis=2)
+def _gaussian_kernel_1d(size=11, sigma=1.5, device="cpu"):
+    coords = torch.arange(size, dtype=torch.float32, device=device) - size // 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    return g / g.sum()
+
+
+def _gaussian_kernel_2d(size=11, sigma=1.5, channels=3, device="cpu"):
+    k1d = _gaussian_kernel_1d(size, sigma, device)
+    k2d = k1d[:, None] * k1d[None, :]
+    kernel = k2d.expand(channels, 1, size, size).contiguous()
+    return kernel
+
+
+def compute_ssim_torch(pred_tensor, gt_tensor, window_size=11, sigma=1.5):
+    """
+    Compute mean SSIM for a batch of NCHW float tensors in [0, 1].
+    Returns per-image SSIM as a 1-D tensor of shape [N].
+    """
+    C = pred_tensor.shape[1]
+    kernel = _gaussian_kernel_2d(window_size, sigma, C, pred_tensor.device)
+    pad = window_size // 2
+
+    mu1 = F.conv2d(pred_tensor, kernel, padding=pad, groups=C)
+    mu2 = F.conv2d(gt_tensor, kernel, padding=pad, groups=C)
+    mu1_sq, mu2_sq, mu12 = mu1 * mu1, mu2 * mu2, mu1 * mu2
+
+    sigma1_sq = F.conv2d(pred_tensor * pred_tensor, kernel, padding=pad, groups=C) - mu1_sq
+    sigma2_sq = F.conv2d(gt_tensor * gt_tensor, kernel, padding=pad, groups=C) - mu2_sq
+    sigma12 = F.conv2d(pred_tensor * gt_tensor, kernel, padding=pad, groups=C) - mu12
+
+    C1, C2 = 0.01 ** 2, 0.03 ** 2
+    ssim_map = ((2 * mu12 + C1) * (2 * sigma12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    return ssim_map.mean(dim=[1, 2, 3])  # [N]
 
 
 def log_validation(
@@ -134,10 +165,15 @@ def log_validation(
             axis=0,
         )
 
-        pred_torch = torch.from_numpy(pred_batch_np).permute(0, 3, 1, 2).float().to(accelerator.device) * 2.0 - 1.0
-        gt_torch = target_image.float()  # already in [-1, 1]
+        pred_torch_01 = torch.from_numpy(pred_batch_np).permute(0, 3, 1, 2).float().to(accelerator.device)
+        gt_torch_01 = torch.from_numpy(target_npy).permute(0, 3, 1, 2).float().to(accelerator.device)
+
+        pred_torch_11 = pred_torch_01 * 2.0 - 1.0
+        gt_torch_11 = gt_torch_01 * 2.0 - 1.0
+
         with torch.no_grad():
-            lpips_vals = lpips_fn(pred_torch, gt_torch).squeeze()  # [B] or scalar
+            lpips_vals = lpips_fn(pred_torch_11, gt_torch_11).squeeze()
+            ssim_vals = compute_ssim_torch(pred_torch_01, gt_torch_01)
         if lpips_vals.dim() == 0:
             lpips_vals = lpips_vals.unsqueeze(0)
 
@@ -145,13 +181,9 @@ def log_validation(
             pred_np = pred_batch_np[i]
             gt_np = target_npy[i]
 
-            psnr_val = compute_psnr(pred_np, gt_np)
-            ssim_val = compute_ssim(pred_np, gt_np)
-            lpips_val = lpips_vals[i].item()
-
-            all_psnr.append(psnr_val)
-            all_ssim.append(ssim_val)
-            all_lpips.append(lpips_val)
+            all_psnr.append(compute_psnr(pred_np, gt_np))
+            all_ssim.append(ssim_vals[i].item())
+            all_lpips.append(lpips_vals[i].item())
 
             name = cond_image_names[i]
             view_name = target_envir_map_names[i]
