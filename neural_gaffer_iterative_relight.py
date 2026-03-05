@@ -277,8 +277,11 @@ def main(args):
         print(f"[{obj_idx+1}/{len(obj_names)}] {obj_name}  "
               f"({len(conditions)} envmap conditions, view {view_id})")
 
+        rng = np.random.RandomState(args.seed)
+        cond_order = rng.choice(len(conditions), size=num_steps, replace=True)
+
         for step in range(num_steps):
-            cond = conditions[step % len(conditions)]
+            cond = conditions[cond_order[step]]
 
             hdr_t = img_tf(Image.open(cond["hdr"]).convert("RGB")) \
                 .unsqueeze(0).to(device, dtype=weight_dtype)
