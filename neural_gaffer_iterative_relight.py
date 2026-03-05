@@ -4,7 +4,9 @@ quality degradation over repeated applications.
 
 Pipeline:
     I (input) --envmap_0--> I_0 --envmap_1--> I_1 --envmap_2--> I_2 ...
-At each step k, metrics are computed against the GT for envmap_k.
+At each step k, metrics are computed against the *original input image* I
+to measure cumulative degradation. Only non-white envmaps are used as
+relighting conditions (white_env_* directories are excluded).
 
 Usage:
     accelerate launch --main_process_port 25539 \
@@ -217,8 +219,11 @@ def main(args):
 
     obj_map = defaultdict(list)
     for subdir in sorted(os.listdir(data_root)):
-        if os.path.isdir(os.path.join(data_root, subdir)):
-            obj_map[extract_object_name(subdir)].append(subdir)
+        if not os.path.isdir(os.path.join(data_root, subdir)):
+            continue
+        if "_white_env_" in subdir:
+            continue
+        obj_map[extract_object_name(subdir)].append(subdir)
 
     obj_names = sorted(obj_map.keys())
     if args.max_objects > 0:
@@ -256,9 +261,15 @@ def main(args):
         if not conditions:
             continue
 
-        # load initial input
+        # load initial input (used as both the starting image and the metric reference)
         init_img = load_rgba_with_bg(conditions[0]["inp"])
         current = img_tf(init_img).unsqueeze(0).to(device, dtype=weight_dtype)
+        input_t = current.clone()
+        input_np = np.array(init_img.resize(
+            (args.resolution, args.resolution), Image.LANCZOS
+        ), dtype=np.float32) / 255.0
+        input_01 = torch.from_numpy(input_np).permute(2, 0, 1).unsqueeze(0).float().to(device)
+        input_11 = input_01 * 2.0 - 1.0
 
         obj_save = os.path.join(save_dir, obj_name)
         os.makedirs(os.path.join(obj_save, "relit"), exist_ok=True)
@@ -293,21 +304,15 @@ def main(args):
             current = img_tf(pil_out.convert("RGB")) \
                 .unsqueeze(0).to(device, dtype=weight_dtype)
 
-            # ---- metrics against GT ----
-            gt_img = load_rgba_with_bg(cond["gt"])
-            gt_t = img_tf(gt_img).unsqueeze(0).to(device, dtype=weight_dtype)
-
+            # ---- metrics against the original input image ----
             pred_np = np.array(pil_out, dtype=np.float32) / 255.0
-            gt_np = 0.5 * (gt_t.squeeze(0).permute(1, 2, 0).cpu().float().numpy() + 1.0)
-
-            psnr_val = compute_psnr(pred_np, gt_np)
+            psnr_val = compute_psnr(pred_np, input_np)
 
             pred_01 = torch.from_numpy(pred_np).permute(2, 0, 1).unsqueeze(0).float().to(device)
-            gt_01 = (gt_t.float() + 1.0) / 2.0
 
             with torch.no_grad():
-                ssim_val = compute_ssim_torch(pred_01, gt_01).item()
-                lpips_val = lpips_fn(pred_01 * 2 - 1, gt_t.float()).item()
+                ssim_val = compute_ssim_torch(pred_01, input_01).item()
+                lpips_val = lpips_fn(pred_01 * 2 - 1, input_11).item()
 
             all_rows.append(dict(
                 object=obj_name, view=view_id, step=step,
