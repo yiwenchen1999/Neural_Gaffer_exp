@@ -1,5 +1,8 @@
 """
-Relight a single input image with 25 randomly chosen environment maps.
+Chain-relight a single input image: each step feeds the previous output
+as input to the next relighting with a different random envmap.
+
+    I --env_0--> I_0 --env_1--> I_1 --env_2--> I_2 ... (25 steps)
 
 Usage:
     accelerate launch --main_process_port 25539 \
@@ -190,7 +193,9 @@ def main(args):
         os.path.join(save_dir, "input.png")
     )
 
-    # ---- relight ----
+    # ---- chain-relight: each step feeds previous output as input ----
+    current = input_tensor
+
     for idx, env in enumerate(chosen):
         hdr_t = img_tf(Image.open(env["hdr"]).convert("RGB")) \
             .unsqueeze(0).to(device, dtype=weight_dtype)
@@ -200,8 +205,8 @@ def main(args):
         gen = [torch.Generator(device=device).manual_seed(args.seed + idx)]
         with torch.autocast("cuda"):
             pil_out = pipeline(
-                input_imgs=input_tensor,
-                prompt_imgs=input_tensor,
+                input_imgs=current,
+                prompt_imgs=current,
                 first_target_envir_map=hdr_t,
                 second_target_envir_map=ldr_t,
                 poses=None,
@@ -211,10 +216,13 @@ def main(args):
                 generator=gen,
             ).images[0]
 
+        # feed output back as input for the next step
+        current = img_tf(pil_out.convert("RGB")) \
+            .unsqueeze(0).to(device, dtype=weight_dtype)
+
         tag = f"{idx:03d}_{env['subdir']}_{env['view']}"
         pil_out.save(os.path.join(save_dir, f"{tag}.png"))
 
-        # also save the LDR envmap for reference
         ldr_pil = Image.open(env["ldr"]).convert("RGB").resize(
             (args.resolution, args.resolution), Image.LANCZOS
         )
@@ -222,7 +230,7 @@ def main(args):
 
         print(f"[{idx+1}/{num}] {env['subdir']}/{env['view']}  -> saved {tag}.png")
 
-    print(f"\nDone. {num} relit images saved to {save_dir}")
+    print(f"\nDone. {num} chained relit images saved to {save_dir}")
 
 
 if __name__ == "__main__":
