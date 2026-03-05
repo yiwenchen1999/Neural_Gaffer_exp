@@ -21,4 +21,4 @@ accelerate launch --main_process_port 25539 \
     --polyhaven_data_root /home/ubuntu/LVSMExp/source_data_polyhaven \
     --save_dir ./iterative_relight_results \
     --num_chain_steps 20 \
-    --max_objects 50
+    --max_objects 30
