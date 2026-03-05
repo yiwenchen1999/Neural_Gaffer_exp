@@ -282,6 +282,18 @@ def parse_args(input_args=None):
         help="Root directory for polyhaven-format relighting evaluation data.",
     )
     parser.add_argument(
+        "--num_chain_steps",
+        type=int,
+        default=50,
+        help="Number of chained relighting steps in the iterative experiment.",
+    )
+    parser.add_argument(
+        "--max_objects",
+        type=int,
+        default=-1,
+        help="Max number of objects to process in iterative relight (-1 = all).",
+    )
+    parser.add_argument(
         "--num_validation_images",
         type=int,
         default=1,
