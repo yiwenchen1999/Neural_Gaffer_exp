@@ -12,7 +12,7 @@ accelerate launch --main_process_port 25539 \
     --polyhaven_data_root /home/ubuntu/LVSMExp/source_data_polyhaven/ \
     --save_dir ./polyhaven_relighting_results
 
-accelerate launch --main_process_port 25539 \
+accelerate launch --main_process_port 25501 \
     --config_file configs/1_16fp.yaml \
     neural_gaffer_iterative_relight.py \
     --output_dir neural_gaffer_res256 \
@@ -21,4 +21,4 @@ accelerate launch --main_process_port 25539 \
     --polyhaven_data_root /home/ubuntu/LVSMExp/source_data_polyhaven \
     --save_dir ./iterative_relight_results \
     --num_chain_steps 20 \
-    --max_objects 30
+    --max_objects 20

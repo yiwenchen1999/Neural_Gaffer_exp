@@ -1,12 +1,13 @@
 """
-Iterative relighting experiment: chain relighting operations and measure
-quality degradation over repeated applications.
+Iterative relighting experiment matching the (scene, envmap) pairs from
+a reference CSV (e.g. degrade_detail_image_space.csv).
 
-Pipeline:
-    I (input) --envmap_0--> I_0 --envmap_1--> I_1 --envmap_2--> I_2 ...
-At each step k, metrics are computed against the GT target for envmap_k.
-Only non-white envmaps are used as relighting conditions
-(white_env_* directories are excluded).
+For each (scene_name, envmap_name) pair the SAME envmap is applied
+repeatedly for num_chain_steps steps:
+
+    I (from scene_name) --envmap--> I_0 --envmap--> I_1 --envmap--> ...
+
+At each step, metrics are computed against the GT target of envmap_name.
 
 Usage:
     accelerate launch --main_process_port 25539 \
@@ -17,15 +18,14 @@ Usage:
         --resume_from_checkpoint latest \
         --polyhaven_data_root /home/ubuntu/LVSMExp/source_data_polyhaven \
         --save_dir ./iterative_relight_results \
-        --num_chain_steps 50 \
-        --max_objects -1
+        --num_chain_steps 20 \
+        --reference_csv degrade_detail_image_space.csv
 """
 
 import os
-import re
 import csv
 from pathlib import Path
-from collections import defaultdict
+from collections import OrderedDict
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -40,7 +40,6 @@ import lpips
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from tqdm import tqdm
 from transformers import CLIPVisionModelWithProjection
 
 from diffusers import (
@@ -90,12 +89,6 @@ def compute_ssim_torch(pred, gt, window_size=11, sigma=1.5):
 
 # --------------- data helpers ---------------
 
-def extract_object_name(subdir_name):
-    """'foo_bar_env_2' -> 'foo_bar', 'foo_bar_white_env_0' -> 'foo_bar'."""
-    m = re.match(r"^(.+?)_(?:white_)?env_\d+$", subdir_name)
-    return m.group(1) if m else subdir_name
-
-
 def load_rgba_with_bg(path, bg=(1.0, 1.0, 1.0)):
     img = np.array(Image.open(path).convert("RGBA"), dtype=np.float32) / 255.0
     alpha = img[:, :, 3:4]
@@ -103,6 +96,33 @@ def load_rgba_with_bg(path, bg=(1.0, 1.0, 1.0)):
     bg_arr = np.array(bg, dtype=np.float32).reshape(1, 1, 3)
     composited = rgb * alpha + bg_arr * (1.0 - alpha)
     return Image.fromarray(np.uint8(composited * 255.0))
+
+
+def parse_pairs_from_csv(csv_path):
+    """Extract unique (scene_name, envmap_name) pairs from reference CSV."""
+    pairs = OrderedDict()
+    with open(csv_path, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            key = (row["scene_name"], row["envmap_name"])
+            if key not in pairs:
+                pairs[key] = int(row["step"]) + 1  # track max steps
+            else:
+                pairs[key] = max(pairs[key], int(row["step"]) + 1)
+    return pairs
+
+
+def find_view_id(data_root, subdir_name):
+    """Find the first available view ID in a subdirectory."""
+    input_dir = os.path.join(data_root, subdir_name, "input_images")
+    if not os.path.isdir(input_dir):
+        return None
+    view_ids = sorted(
+        os.path.splitext(f)[0]
+        for f in os.listdir(input_dir)
+        if f.endswith(".png") or f.endswith(".jpg")
+    )
+    return view_ids[0] if view_ids else None
 
 
 # --------------- main ---------------
@@ -211,78 +231,64 @@ def main(args):
         transforms.Normalize([0.5], [0.5]),
     ])
 
-    # ---- discover objects ----
+    # ---- parse reference CSV for (scene, envmap) pairs ----
     data_root = args.polyhaven_data_root
     save_dir = args.save_dir
     os.makedirs(save_dir, exist_ok=True)
     num_steps = args.num_chain_steps
 
-    obj_map = defaultdict(list)
-    for subdir in sorted(os.listdir(data_root)):
-        if not os.path.isdir(os.path.join(data_root, subdir)):
-            continue
-        if "_white_env_" in subdir:
-            continue
-        obj_map[extract_object_name(subdir)].append(subdir)
-
-    obj_names = sorted(obj_map.keys())
-    if args.max_objects > 0:
-        obj_names = obj_names[: args.max_objects]
-
-    print(f"Running iterative relight on {len(obj_names)} objects, "
-          f"{num_steps} steps each.")
+    pairs = parse_pairs_from_csv(args.reference_csv)
+    print(f"Loaded {len(pairs)} (scene, envmap) pairs from {args.reference_csv}")
 
     all_rows = []
+    pair_idx = 0
 
-    for obj_idx, obj_name in enumerate(obj_names):
-        subdirs = obj_map[obj_name]
+    for (scene_name, envmap_name), csv_steps in pairs.items():
+        pair_idx += 1
+        steps_to_run = num_steps
 
-        # pick the first view that is common across all subdirs
-        first_input_dir = os.path.join(data_root, subdirs[0], "input_images")
-        view_ids = sorted(
-            os.path.splitext(f)[0]
-            for f in os.listdir(first_input_dir)
-            if f.endswith(".png") or f.endswith(".jpg")
-        )
-        if not view_ids:
-            continue
-        view_id = view_ids[0]
-
-        # collect conditions (envmap + gt) for this view
-        conditions = []
-        for subdir in subdirs:
-            hdr = os.path.join(data_root, subdir, "envmaps", f"{view_id}_hdr.png")
-            ldr = os.path.join(data_root, subdir, "envmaps", f"{view_id}_ldr.png")
-            gt  = os.path.join(data_root, subdir, "target_images", f"{view_id}.png")
-            inp = os.path.join(data_root, subdir, "input_images", f"{view_id}.png")
-            if all(os.path.exists(p) for p in [hdr, ldr, gt, inp]):
-                conditions.append(dict(subdir=subdir, hdr=hdr, ldr=ldr, gt=gt, inp=inp))
-
-        if not conditions:
+        # find a common view_id between scene and envmap subdirs
+        view_id = find_view_id(data_root, scene_name)
+        if view_id is None:
+            print(f"  SKIP {scene_name}: no input images found")
             continue
 
-        # load initial input
-        init_img = load_rgba_with_bg(conditions[0]["inp"])
+        # build paths
+        inp_path = os.path.join(data_root, scene_name, "input_images", f"{view_id}.png")
+        hdr_path = os.path.join(data_root, envmap_name, "envmaps", f"{view_id}_hdr.png")
+        ldr_path = os.path.join(data_root, envmap_name, "envmaps", f"{view_id}_ldr.png")
+        gt_path  = os.path.join(data_root, envmap_name, "target_images", f"{view_id}.png")
+
+        missing = [p for p in [inp_path, hdr_path, ldr_path, gt_path] if not os.path.exists(p)]
+        if missing:
+            print(f"  SKIP {scene_name} / {envmap_name}: missing {missing}")
+            continue
+
+        # load input
+        init_img = load_rgba_with_bg(inp_path)
         current = img_tf(init_img).unsqueeze(0).to(device, dtype=weight_dtype)
 
-        obj_save = os.path.join(save_dir, obj_name)
-        os.makedirs(os.path.join(obj_save, "relit"), exist_ok=True)
+        # load envmap (same for every step)
+        hdr_t = img_tf(Image.open(hdr_path).convert("RGB")) \
+            .unsqueeze(0).to(device, dtype=weight_dtype)
+        ldr_t = img_tf(Image.open(ldr_path).convert("RGB")) \
+            .unsqueeze(0).to(device, dtype=weight_dtype)
 
-        print(f"[{obj_idx+1}/{len(obj_names)}] {obj_name}  "
-              f"({len(conditions)} envmap conditions, view {view_id})")
+        # load GT (same for every step)
+        gt_img = load_rgba_with_bg(gt_path)
+        gt_np = np.array(gt_img.resize(
+            (args.resolution, args.resolution), Image.LANCZOS
+        ), dtype=np.float32) / 255.0
+        gt_01 = torch.from_numpy(gt_np).permute(2, 0, 1).unsqueeze(0).float().to(device)
+        gt_11 = gt_01 * 2.0 - 1.0
 
-        rng = np.random.RandomState(args.seed)
-        cond_order = rng.choice(len(conditions), size=num_steps, replace=True)
+        pair_save = os.path.join(save_dir, f"{scene_name}__{envmap_name}")
+        os.makedirs(pair_save, exist_ok=True)
 
-        for step in range(num_steps):
-            cond = conditions[cond_order[step]]
+        print(f"[{pair_idx}/{len(pairs)}] scene={scene_name}  envmap={envmap_name}  "
+              f"view={view_id}  steps={steps_to_run}")
 
-            hdr_t = img_tf(Image.open(cond["hdr"]).convert("RGB")) \
-                .unsqueeze(0).to(device, dtype=weight_dtype)
-            ldr_t = img_tf(Image.open(cond["ldr"]).convert("RGB")) \
-                .unsqueeze(0).to(device, dtype=weight_dtype)
-
-            # run relighting
+        for step in range(steps_to_run):
             gen = [torch.Generator(device=device).manual_seed(args.seed)]
             with torch.autocast("cuda"):
                 pil_out = pipeline(
@@ -297,43 +303,35 @@ def main(args):
                     generator=gen,
                 ).images[0]
 
-            # convert output back to tensor for next iteration
+            # feed output back
             current = img_tf(pil_out.convert("RGB")) \
                 .unsqueeze(0).to(device, dtype=weight_dtype)
 
-            # ---- metrics against the GT for this envmap ----
-            gt_img = load_rgba_with_bg(cond["gt"])
-            gt_np = np.array(gt_img.resize(
-                (args.resolution, args.resolution), Image.LANCZOS
-            ), dtype=np.float32) / 255.0
-            gt_01 = torch.from_numpy(gt_np).permute(2, 0, 1).unsqueeze(0).float().to(device)
-            gt_11 = gt_01 * 2.0 - 1.0
-
+            # metrics against GT
             pred_np = np.array(pil_out, dtype=np.float32) / 255.0
             psnr_val = compute_psnr(pred_np, gt_np)
 
             pred_01 = torch.from_numpy(pred_np).permute(2, 0, 1).unsqueeze(0).float().to(device)
-
             with torch.no_grad():
                 ssim_val = compute_ssim_torch(pred_01, gt_01).item()
                 lpips_val = lpips_fn(pred_01 * 2 - 1, gt_11).item()
 
             all_rows.append(dict(
-                object=obj_name, view=view_id, step=step,
-                envmap=cond["subdir"],
+                scene_name=scene_name, step=step,
                 psnr=psnr_val, ssim=ssim_val, lpips=lpips_val,
+                envmap_name=envmap_name,
             ))
 
-            pil_out.save(os.path.join(obj_save, "relit", f"step_{step:03d}.png"))
+            pil_out.save(os.path.join(pair_save, f"step_{step:03d}.png"))
 
-            print(f"  step {step:3d}  envmap={cond['subdir']:40s}  "
+            print(f"  step {step:3d}  "
                   f"PSNR={psnr_val:6.2f}  SSIM={ssim_val:.4f}  LPIPS={lpips_val:.4f}")
 
-    # ---- save CSV ----
+    # ---- save CSV (same column order as reference) ----
     csv_path = os.path.join(save_dir, "iterative_metrics.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(
-            f, fieldnames=["object", "view", "step", "envmap", "psnr", "ssim", "lpips"]
+            f, fieldnames=["scene_name", "step", "psnr", "ssim", "lpips", "envmap_name"]
         )
         writer.writeheader()
         writer.writerows(all_rows)
@@ -365,8 +363,9 @@ def main(args):
     axes[2].set_title("LPIPS vs. Iterative Relighting Step")
     axes[2].grid(True, alpha=0.3)
 
+    n_pairs = len(pairs)
     fig.suptitle(
-        f"Iterative Relighting Degradation ({len(obj_names)} objects, {num_steps} steps)",
+        f"Iterative Relighting Degradation ({n_pairs} pairs, {num_steps} steps)",
         fontsize=14, y=1.02,
     )
     fig.tight_layout()
@@ -374,7 +373,6 @@ def main(args):
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     print(f"Plot saved to {plot_path}")
 
-    # print summary table
     print(f"\n{'Step':>5s}  {'PSNR':>8s}  {'SSIM':>8s}  {'LPIPS':>8s}")
     print("-" * 35)
     for s, p, ss, lp in zip(steps, mean_psnr, mean_ssim, mean_lpips):

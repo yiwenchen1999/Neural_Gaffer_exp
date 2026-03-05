@@ -284,8 +284,14 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--num_chain_steps",
         type=int,
-        default=50,
+        default=20,
         help="Number of chained relighting steps in the iterative experiment.",
+    )
+    parser.add_argument(
+        "--reference_csv",
+        type=str,
+        default="degrade_detail_image_space.csv",
+        help="Reference CSV with (scene_name, envmap_name) pairs to replicate.",
     )
     parser.add_argument(
         "--max_objects",
