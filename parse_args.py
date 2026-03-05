@@ -294,6 +294,18 @@ def parse_args(input_args=None):
         help="Max number of objects to process in iterative relight (-1 = all).",
     )
     parser.add_argument(
+        "--input_image",
+        type=str,
+        default=None,
+        help="Path to a single input image for relighting.",
+    )
+    parser.add_argument(
+        "--num_relights",
+        type=int,
+        default=25,
+        help="Number of random envmaps to relight the input image with.",
+    )
+    parser.add_argument(
         "--num_validation_images",
         type=int,
         default=1,
