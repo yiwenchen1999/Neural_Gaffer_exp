@@ -312,6 +312,12 @@ def parse_args(input_args=None):
         help="Number of random envmaps to relight the input image with.",
     )
     parser.add_argument(
+        "--benchmark_samples",
+        type=int,
+        default=100,
+        help="Number of samples to benchmark inference on.",
+    )
+    parser.add_argument(
         "--num_validation_images",
         type=int,
         default=1,
