@@ -186,9 +186,10 @@ def main(args):
     save_dir = args.save_dir
     os.makedirs(save_dir, exist_ok=True)
 
-    # ---- warmup (1 sample, not timed) ----
+    # ---- warmup (not timed) ----
     print("Warmup run...")
     warmup_batch = next(iter(dataloader))
+    warmup_bsz = warmup_batch["image_cond"].shape[0]
     with torch.autocast("cuda"), torch.no_grad():
         pipeline(
             input_imgs=warmup_batch["image_cond"].to(dtype=weight_dtype),
@@ -199,7 +200,7 @@ def main(args):
             height=args.resolution, width=args.resolution,
             guidance_scale=args.guidance_scale,
             num_inference_steps=50,
-            generator=[torch.Generator(device=device).manual_seed(args.seed)],
+            generator=[torch.Generator(device=device).manual_seed(args.seed + i) for i in range(warmup_bsz)],
         )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
