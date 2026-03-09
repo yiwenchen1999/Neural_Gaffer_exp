@@ -166,7 +166,7 @@ def main(args):
     dataloader = torch.utils.data.DataLoader(
         subset,
         shuffle=False,
-        batch_size=1,
+        batch_size=100,
         num_workers=1,
         pin_memory=True,
     )
@@ -276,7 +276,7 @@ def main(args):
         "mixed_precision": args.mixed_precision,
         "diffusion_steps": 50,
         "guidance_scale": args.guidance_scale,
-        "batch_size": 1,
+        "batch_size": 100,
         "gpu": gpu_name,
         "total_wall_time_s": round(total_wall_time, 3),
         "avg_time_per_sample_s": round(float(times.mean()), 3),
